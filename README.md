@@ -1,117 +1,160 @@
-# SOC-Style-PCAP-Analyzer-v2-Upgraded-
-Built a Python-based PCAP analysis tool simulating SOC workflows, including beaconing detection, anomaly scoring, and automated reporting aligned with MITRE ATT&amp;CK.
-pip install pyshark pandas
+# SOC PCAP Analyzer
 
-import pyshark
-import pandas as pd
-from collections import Counter, defaultdict
+A Python-based PCAP analysis tool simulating real SOC analyst workflows. Performs **beaconing detection via interval variance analysis**, DNS exfiltration scoring, HTTP anomaly detection, and rare-port alerting — all mapped to MITRE ATT&CK TTPs. Outputs structured console, CSV, and JSON reports.
 
-PCAP_FILE = "sample.pcap"
+> Built as a portfolio project by Michael "Tony" Lee — SOC Analyst | MSSP | DFIR  
+> 🔗 [Live Dashboard Demo](https://your-github-username.github.io/pcap-analyzer/)
 
+---
 
-# -----------------------------
-# Helper: Simple risk scoring
-# -----------------------------
-def calculate_risk(count):
-    if count > 100:
-        return "HIGH"
-    elif count > 30:
-        return "MEDIUM"
-    else:
-        return "LOW"
+## Features
 
+| Module | Detection Method | MITRE TTP |
+|---|---|---|
+| Beaconing | Coefficient of Variation (CV) on inter-packet intervals | T1071 |
+| DNS Exfiltration | Shannon entropy + subdomain length scoring | T1048.003 |
+| HTTP Anomalies | Keyword pattern matching against known offensive indicators | T1190 |
+| Rare Port Usage | Destination port comparison against known C2/offensive ports | T1571 |
+| Composite Risk Score | Weighted multi-signal scoring engine (0–100) | — |
 
-# -----------------------------
-# Main Analyzer
-# -----------------------------
-def analyze_pcap(file):
-    print("\n[+] Loading PCAP...\n")
+### Why interval variance for beaconing?
 
-    cap = pyshark.FileCapture(file, only_summaries=True)
+Most simple beaconing detectors just count connections. The problem: legitimate software also generates high connection volumes (telemetry, update checks). 
 
-    ip_counter = Counter()
-    dns_counter = Counter()
-    http_counter = Counter()
+Real C2 beaconing is distinguished by its **regularity** — malware phones home on a timer. This tool calculates the **Coefficient of Variation (CV = σ/μ)** of inter-packet intervals per IP:
 
-    packet_data = []
+- **CV < 0.10** → Highly regular → Strong beacon signature (score: 100)
+- **CV 0.10–0.25** → Slightly jittered → Likely beacon (score: 80)
+- **CV > 0.60** → Irregular → Likely benign traffic (score: 0)
 
-    for packet in cap:
-        try:
-            info = packet.info.lower()
+This dramatically reduces false positives on high-volume legitimate hosts.
 
-            # crude IP extraction
-            if "->" in info:
-                parts = info.split("->")
-                src = parts[0].strip().split()[-1]
-                dst = parts[1].strip().split()[0]
+---
 
-                ip_counter[src] += 1
-                ip_counter[dst] += 1
+## Requirements
 
-                packet_data.append({
-                    "source": src,
-                    "destination": dst,
-                    "info": info
-                })
+```bash
+pip install pyshark pandas colorama
+```
 
-            # DNS detection
-            if "dns" in info:
-                dns_counter[info] += 1
+> **Note:** pyshark requires Wireshark/tshark to be installed on your system.  
+> Download: https://www.wireshark.org/download.html
 
-            # HTTP detection
-            if "http" in info:
-                http_counter[info] += 1
+---
 
-        except:
-            continue
+## Usage
 
-    cap.close()
+```bash
+# Analyze a PCAP file (outputs console + CSV + JSON)
+python analyzer.py --pcap capture.pcap
 
-    # -----------------------------
-    # BEACONING DETECTION
-    # -----------------------------
-    beacon_alerts = []
-    for ip, count in ip_counter.items():
-        if count > 20:  # simple heuristic
-            beacon_alerts.append({
-                "ip": ip,
-                "connections": count,
-                "risk": calculate_risk(count),
-                "mitre": "T1071 - Application Layer Protocol (Possible C2)"
-            })
+# Run with synthetic demo data (no PCAP required)
+python analyzer.py --demo
 
-    # -----------------------------
-    # OUTPUT REPORT
-    # -----------------------------
-    print("\n========== SOC ANALYSIS REPORT ==========\n")
+# Adjust beaconing sensitivity threshold
+python analyzer.py --pcap capture.pcap --threshold 15
 
-    print(f"Total Unique IPs: {len(ip_counter)}")
+# Output formats: console, csv, json, all (default)
+python analyzer.py --pcap capture.pcap --output json
+```
 
-    print("\n[Top Talkers]")
-    for ip, count in ip_counter.most_common(5):
-        print(f"{ip} -> {count} connections | Risk: {calculate_risk(count)}")
+---
 
-    print("\n[DNS Activity]")
-    for dns, count in dns_counter.most_common(3):
-        print(f"{dns[:80]}... ({count})")
+## Sample Output
 
-    print("\n[HTTP Activity]")
-    for http, count in http_counter.most_common(3):
-        print(f"{http[:80]}... ({count})")
+```
+════════════════════════════════════════════════════════════
+  SOC PCAP ANALYSIS REPORT
+  File     : capture.pcap
+  Analyzed : 2024-11-15T14:32:01Z
+  Packets  : 3,142  |  Duration: 3600s
+  Unique IPs: 9
+════════════════════════════════════════════════════════════
 
-    print("\n[🚨 Beaconing / C2 Suspicion]")
-    for b in beacon_alerts:
-        print(f"{b['ip']} -> {b['connections']} connections | {b['risk']} | {b['mitre']}")
+[TOP TALKERS]
+────────────────────────────────────────────────────────────
+  192.168.1.105        312 conns  Risk: CRITICAL   Score: 82
+  185.220.101.7        154 conns  Risk: HIGH       Score: 76
+  10.0.0.44            187 conns  Risk: HIGH       Score: 55
 
-    # -----------------------------
-    # EXPORT CSV (SOC STYLE REPORT)
-    # -----------------------------
-    df = pd.DataFrame(beacon_alerts)
-    df.to_csv("soc_report.csv", index=False)
+[BEACONING ALERTS — T1071]
+────────────────────────────────────────────────────────────
+  [!] 185.220.101.7        Pkts: 154    Interval CV: 0.047    Beacon Score: 94/100
+  [!] 192.168.1.105        Pkts: 312    Interval CV: 0.183    Beacon Score: 71/100
 
-    print("\n[+] Report exported to soc_report.csv")
-    print("=========================================\n")
+[DNS ANALYSIS — T1048.003]
+────────────────────────────────────────────────────────────
+  Total queries: 487  |  Unique domains: 38
 
+  Suspicious (high entropy):
+    [!] a2fghj3kl9mn0pq.exfil-domain.xyz          Entropy: 88/100
+    [!] b3xyz8abc1def2ghi4jkl.tunnel.bad.io        Entropy: 79/100
+```
 
-if __name__ == "__main__":
-    analyze_pcap(PCAP_FILE)
+---
+
+## Architecture
+
+```
+analyzer.py
+├── RiskEngine          # Weighted composite scoring (0-100)
+│   ├── score_connection_volume()
+│   ├── score_beacon_regularity()  # CV-based interval analysis
+│   ├── score_dns_entropy()        # Shannon entropy + length
+│   ├── score_rare_port()
+│   └── composite()                # Weighted aggregate
+│
+├── BeaconDetector      # Per-IP timestamp tracking → CV analysis
+├── DNSAnalyzer         # Query entropy scoring + known-benign filtering
+├── PortAnalyzer        # Rare port detection → T1571
+└── PCAPAnalyzer        # Orchestrator: load → analyze → report
+```
+
+---
+
+## Dashboard
+
+A standalone `dashboard.html` is included for visual reporting. Open locally or deploy via GitHub Pages.
+
+![Dashboard Screenshot](https://via.placeholder.com/900x500/0d1117/58a6ff?text=SOC+Dashboard)
+
+---
+
+## Report Outputs
+
+- **Console** — Color-coded terminal output with risk scoring
+- **CSV** → `reports/soc_report_<timestamp>.csv` — flat alert rows for SIEM ingestion
+- **JSON** → `reports/soc_report_<timestamp>.json` — structured data for automation
+
+---
+
+## Roadmap
+
+- [ ] Live capture mode (`--live eth0`)
+- [ ] Lateral movement detection (internal-to-internal unusual ports)
+- [ ] JA3/JA3S TLS fingerprinting
+- [ ] VirusTotal IOC enrichment via API
+- [ ] STIX 2.1 report export
+
+---
+
+## Certifications & Context
+
+This project demonstrates concepts aligned with:
+- CompTIA CySA+ (CS0-003) — Network analysis, threat detection
+- MITRE ATT&CK for Enterprise — TTP mapping
+- NIST SP 800-61 — Incident response workflow alignment
+
+---
+
+## Author
+
+**Michael "Tony" Lee** — Information Security Analyst  
+Warrenville, SC · [mlee30907@gmail.com](mailto:mlee30907@gmail.com)  
+CompTIA Security+ · ISC2 CC · Cisco CyberOps Associate · CrowdStrike CCFA
+
+---
+
+## License
+
+MIT — free to use, fork, and learn from.
