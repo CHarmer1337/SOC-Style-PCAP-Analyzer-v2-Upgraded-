@@ -1,0 +1,632 @@
+name: Deploy Dashboard to GitHub Pages
+
+on:
+  push:
+    branches: [ main ]
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+jobs:
+  deploy:
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/configure-pages@v4
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: '.'
+      - id: deployment
+        uses: actions/deploy-pages@v4
+
+#!/usr/bin/env python3
+"""
+SOC-Style PCAP Analyzer
+Author: Michael "Tony" Lee
+Description:
+    A Python-based PCAP analysis tool simulating SOC analyst workflows.
+    Performs beaconing detection via interval variance analysis, DNS
+    exfiltration scoring, anomaly-based risk scoring, and generates
+    structured HTML + CSV reports aligned with MITRE ATT&CK TTPs.
+
+Usage:
+    python analyzer.py --pcap <file.pcap> [--threshold 20] [--output html]
+
+Requirements:
+    pip install pyshark pandas jinja2 colorama
+"""
+
+import argparse
+import json
+import os
+import statistics
+import sys
+from collections import Counter, defaultdict
+from datetime import datetime
+from pathlib import Path
+
+try:
+    import pandas as pd
+    from colorama import Fore, Style, init as colorama_init
+    colorama_init(autoreset=True)
+    HAS_DEPS = True
+except ImportError:
+    HAS_DEPS = False
+
+try:
+    import pyshark
+    HAS_PYSHARK = True
+except ImportError:
+    HAS_PYSHARK = False
+
+# ─────────────────────────────────────────────
+# MITRE ATT&CK TTP Mapping
+# ─────────────────────────────────────────────
+MITRE_MAP = {
+    "beaconing":         {"id": "T1071",  "name": "Application Layer Protocol",        "tactic": "Command & Control"},
+    "dns_exfil":         {"id": "T1048.003", "name": "Exfiltration Over DNS",           "tactic": "Exfiltration"},
+    "port_scan":         {"id": "T1046",  "name": "Network Service Discovery",          "tactic": "Discovery"},
+    "high_volume":       {"id": "T1498",  "name": "Network Denial of Service",          "tactic": "Impact"},
+    "rare_port":         {"id": "T1571",  "name": "Non-Standard Port",                  "tactic": "Command & Control"},
+    "http_suspicious":   {"id": "T1190",  "name": "Exploit Public-Facing Application",  "tactic": "Initial Access"},
+}
+
+KNOWN_BENIGN_DOMAINS = {
+    "google.com", "googleapis.com", "gstatic.com", "microsoft.com",
+    "windowsupdate.com", "office.com", "cloudflare.com", "amazon.com",
+    "akamaiedge.net", "akadns.net", "clients1.google.com",
+}
+
+SUSPICIOUS_KEYWORDS = [
+    "cmd=", "exec=", "shell=", "whoami", "base64", "powershell",
+    "wget", "curl", "nc ", "ncat", "eval(", "/etc/passwd", "cmd.exe",
+    ".onion", "pastebin.com", "raw.githubusercontent",
+]
+
+RARE_PORTS = {4444, 1337, 31337, 6666, 6667, 8888, 9001, 9050, 12345}
+
+# ─────────────────────────────────────────────
+# Risk Scoring Engine
+# ─────────────────────────────────────────────
+class RiskEngine:
+    """Composite risk scorer with weighted signals."""
+
+    WEIGHTS = {
+        "connection_volume": 0.25,
+        "beacon_regularity": 0.35,
+        "dns_entropy":       0.20,
+        "rare_port":         0.10,
+        "http_anomaly":      0.10,
+    }
+
+    @staticmethod
+    def score_connection_volume(count: int) -> float:
+        if count > 200: return 1.0
+        if count > 100: return 0.75
+        if count > 50:  return 0.50
+        if count > 20:  return 0.25
+        return 0.0
+
+    @staticmethod
+    def score_beacon_regularity(intervals: list) -> float:
+        """
+        Detects beaconing via coefficient of variation (CV) of inter-packet
+        intervals. Real beaconing is highly regular (low CV). Random traffic
+        is noisy (high CV).
+
+        Returns 0.0 (no beacon) to 1.0 (strong beacon signature).
+        """
+        if len(intervals) < 5:
+            return 0.0
+        try:
+            mean = statistics.mean(intervals)
+            if mean == 0:
+                return 0.0
+            stdev = statistics.stdev(intervals)
+            cv = stdev / mean  # Coefficient of Variation
+            # Low CV = regular intervals = beaconing
+            if cv < 0.10: return 1.0   # Very regular
+            if cv < 0.25: return 0.80
+            if cv < 0.40: return 0.55
+            if cv < 0.60: return 0.30
+            return 0.0
+        except statistics.StatisticsError:
+            return 0.0
+
+    @staticmethod
+    def score_dns_entropy(hostname: str) -> float:
+        """
+        Scores DNS query suspicion via Shannon entropy + subdomain length.
+        High entropy + long subdomain = likely DNS exfiltration.
+        """
+        import math
+        subdomain = hostname.split(".")[0] if "." in hostname else hostname
+        if len(subdomain) < 10:
+            return 0.0
+
+        # Shannon entropy of subdomain characters
+        freq = Counter(subdomain.lower())
+        total = len(subdomain)
+        entropy = -sum((c / total) * math.log2(c / total) for c in freq.values())
+
+        # Normalize: random strings have ~4.5 bits/char; dictionary words ~3.2
+        normalized = min(entropy / 4.5, 1.0)
+
+        # Boost score for very long subdomains (exfil encoding)
+        length_bonus = min(len(subdomain) / 60, 0.4)
+
+        return min(normalized + length_bonus, 1.0)
+
+    @staticmethod
+    def score_rare_port(dst_port: int) -> float:
+        return 1.0 if dst_port in RARE_PORTS else 0.0
+
+    @staticmethod
+    def score_http_anomaly(http_info: str) -> float:
+        http_lower = http_info.lower()
+        hits = sum(1 for kw in SUSPICIOUS_KEYWORDS if kw in http_lower)
+        return min(hits * 0.35, 1.0)
+
+    @classmethod
+    def composite(cls, signals: dict) -> tuple:
+        """Returns (score 0-100, label)"""
+        raw = sum(
+            cls.WEIGHTS.get(k, 0) * v
+            for k, v in signals.items()
+        )
+        score = round(raw * 100)
+        if score >= 70:   label = "CRITICAL"
+        elif score >= 50: label = "HIGH"
+        elif score >= 30: label = "MEDIUM"
+        else:             label = "LOW"
+        return score, label
+
+
+# ─────────────────────────────────────────────
+# Detection Modules
+# ─────────────────────────────────────────────
+class BeaconDetector:
+    """Tracks per-IP packet timestamps and scores beacon regularity."""
+
+    def __init__(self):
+        self.ip_timestamps = defaultdict(list)
+
+    def record(self, src_ip: str, timestamp: float):
+        self.ip_timestamps[src_ip].append(timestamp)
+
+    def analyze(self) -> list:
+        results = []
+        for ip, timestamps in self.ip_timestamps.items():
+            if len(timestamps) < 5:
+                continue
+            timestamps.sort()
+            intervals = [
+                timestamps[i+1] - timestamps[i]
+                for i in range(len(timestamps) - 1)
+            ]
+            score = RiskEngine.score_beacon_regularity(intervals)
+            if score >= 0.30:
+                results.append({
+                    "ip": ip,
+                    "packet_count": len(timestamps),
+                    "mean_interval_sec": round(statistics.mean(intervals), 2),
+                    "interval_cv": round(
+                        statistics.stdev(intervals) / statistics.mean(intervals), 3
+                    ) if statistics.mean(intervals) > 0 else 0,
+                    "beacon_score": round(score * 100),
+                    "mitre": MITRE_MAP["beaconing"],
+                })
+        return sorted(results, key=lambda x: x["beacon_score"], reverse=True)
+
+
+class DNSAnalyzer:
+    """Analyzes DNS queries for exfiltration and suspicious patterns."""
+
+    def __init__(self):
+        self.queries = []
+
+    def record(self, hostname: str, src_ip: str):
+        self.queries.append({"hostname": hostname, "src_ip": src_ip})
+
+    def analyze(self) -> dict:
+        query_counts = Counter(q["hostname"] for q in self.queries)
+        suspicious = []
+
+        for hostname, count in query_counts.most_common(20):
+            entropy_score = RiskEngine.score_dns_entropy(hostname)
+            is_known_benign = any(
+                hostname.endswith(d) for d in KNOWN_BENIGN_DOMAINS
+            )
+            if entropy_score > 0.45 and not is_known_benign:
+                suspicious.append({
+                    "hostname": hostname,
+                    "query_count": count,
+                    "entropy_score": round(entropy_score * 100),
+                    "mitre": MITRE_MAP["dns_exfil"],
+                })
+
+        return {
+            "total_queries": len(self.queries),
+            "unique_domains": len(query_counts),
+            "top_queries": [
+                {"hostname": h, "count": c}
+                for h, c in query_counts.most_common(10)
+            ],
+            "suspicious": suspicious,
+        }
+
+
+class PortAnalyzer:
+    """Tracks destination ports for rare/non-standard port usage."""
+
+    def __init__(self):
+        self.connections = []
+
+    def record(self, src_ip: str, dst_ip: str, dst_port: int):
+        self.connections.append({
+            "src": src_ip, "dst": dst_ip, "port": dst_port
+        })
+
+    def analyze(self) -> dict:
+        port_counts = Counter(c["port"] for c in self.connections)
+        rare_hits = [
+            {"src": c["src"], "dst": c["dst"], "port": c["port"],
+             "mitre": MITRE_MAP["rare_port"]}
+            for c in self.connections
+            if c["port"] in RARE_PORTS
+        ]
+        return {
+            "top_ports": [
+                {"port": p, "count": c}
+                for p, c in port_counts.most_common(10)
+            ],
+            "rare_port_alerts": rare_hits,
+        }
+
+
+# ─────────────────────────────────────────────
+# Main Analyzer
+# ─────────────────────────────────────────────
+class PCAPAnalyzer:
+
+    def __init__(self, pcap_file: str, beacon_threshold: int = 20):
+        self.pcap_file = pcap_file
+        self.beacon_threshold = beacon_threshold
+        self.ip_counter = Counter()
+        self.http_events = []
+        self.beacon_detector = BeaconDetector()
+        self.dns_analyzer = DNSAnalyzer()
+        self.port_analyzer = PortAnalyzer()
+        self.start_time = None
+        self.end_time = None
+        self.packet_count = 0
+
+    def _log(self, msg: str, level: str = "info"):
+        colors = {
+            "info":    Fore.CYAN    if HAS_DEPS else "",
+            "warn":    Fore.YELLOW  if HAS_DEPS else "",
+            "alert":   Fore.RED     if HAS_DEPS else "",
+            "success": Fore.GREEN   if HAS_DEPS else "",
+        }
+        reset = Style.RESET_ALL if HAS_DEPS else ""
+        print(f"{colors.get(level, '')}[{level.upper():7}] {msg}{reset}")
+
+    def load(self):
+        if not HAS_PYSHARK:
+            self._log("pyshark not installed — running in demo mode with synthetic data.", "warn")
+            self._load_demo_data()
+            return
+
+        if not Path(self.pcap_file).exists():
+            self._log(f"File not found: {self.pcap_file} — running demo mode.", "warn")
+            self._load_demo_data()
+            return
+
+        self._log(f"Loading {self.pcap_file}...")
+        cap = pyshark.FileCapture(self.pcap_file)
+
+        for pkt in cap:
+            try:
+                self.packet_count += 1
+                ts = float(pkt.sniff_timestamp)
+                if self.start_time is None:
+                    self.start_time = ts
+                self.end_time = ts
+
+                src_ip = dst_ip = dst_port = None
+
+                if hasattr(pkt, "ip"):
+                    src_ip = pkt.ip.src
+                    dst_ip = pkt.ip.dst
+                    self.ip_counter[src_ip] += 1
+                    self.ip_counter[dst_ip] += 1
+                    self.beacon_detector.record(src_ip, ts)
+
+                if hasattr(pkt, "tcp"):
+                    dst_port = int(pkt.tcp.dstport)
+                elif hasattr(pkt, "udp"):
+                    dst_port = int(pkt.udp.dstport)
+
+                if src_ip and dst_ip and dst_port:
+                    self.port_analyzer.record(src_ip, dst_ip, dst_port)
+
+                if hasattr(pkt, "dns") and hasattr(pkt.dns, "qry_name"):
+                    self.dns_analyzer.record(pkt.dns.qry_name, src_ip or "")
+
+                if hasattr(pkt, "http"):
+                    info = str(pkt.http)
+                    self.http_events.append({
+                        "src": src_ip,
+                        "dst": dst_ip,
+                        "info": info[:200],
+                        "anomaly_score": round(
+                            RiskEngine.score_http_anomaly(info) * 100
+                        ),
+                    })
+            except Exception:
+                continue
+
+        cap.close()
+        self._log(f"Loaded {self.packet_count:,} packets.", "success")
+
+    def _load_demo_data(self):
+        """Synthetic data for demo/testing without a real PCAP."""
+        import random
+        self.packet_count = 3142
+        self.start_time = 1700000000.0
+        self.end_time   = 1700003600.0
+
+        ips = {
+            "192.168.1.105": 312, "10.0.0.44": 187, "185.220.101.7": 154,
+            "172.16.0.3": 89,     "192.168.1.1": 76, "10.0.0.12": 54,
+            "8.8.8.8": 42,        "104.21.14.55": 38, "192.168.1.200": 27,
+        }
+        for ip, count in ips.items():
+            self.ip_counter[ip] = count
+            base_ts = self.start_time
+            # Beacon IPs get regular intervals; others get random
+            for _ in range(count):
+                if ip == "185.220.101.7":
+                    base_ts += 60 + random.gauss(0, 2)   # Regular ~60s beacon
+                else:
+                    base_ts += random.uniform(1, 300)
+                self.beacon_detector.record(ip, base_ts)
+
+        dns_queries = [
+            ("update.windowsdefender-cdn.com", "192.168.1.105"),
+            ("a2fghj3kl9mn0pq.exfil-domain.xyz", "192.168.1.200"),
+            ("b3xyz8abc1def2ghi.tunnel.bad.io", "192.168.1.200"),
+            ("api.dropboxapi.com", "10.0.0.44"),
+            ("telemetry.microsoft.com", "10.0.0.12"),
+            ("raw.githubusercontent.com", "172.16.0.3"),
+        ]
+        for host, ip in dns_queries:
+            for _ in range(random.randint(5, 50)):
+                self.dns_analyzer.record(host, ip)
+
+        ports = [(80, 400), (443, 820), (53, 310), (4444, 12), (8080, 55), (1337, 3)]
+        for port, count in ports:
+            src = random.choice(list(ips.keys()))
+            for _ in range(count):
+                self.port_analyzer.record(src, "185.220.101.7", port)
+
+        self.http_events = [
+            {"src": "192.168.1.105", "dst": "185.220.101.7",
+             "info": "POST /upload HTTP/1.1 Content-Length: 48291", "anomaly_score": 20},
+            {"src": "172.16.0.3",    "dst": "185.220.101.7",
+             "info": "GET /index.php?cmd=whoami HTTP/1.0", "anomaly_score": 70},
+            {"src": "10.0.0.44",     "dst": "104.21.14.55",
+             "info": "GET /shell.php?exec=base64_decode HTTP/1.1", "anomaly_score": 85},
+        ]
+
+    def run(self) -> dict:
+        beacon_results = self.beacon_detector.analyze()
+        dns_results    = self.dns_analyzer.analyze()
+        port_results   = self.port_analyzer.analyze()
+
+        top_talkers = []
+        for ip, count in self.ip_counter.most_common(10):
+            signals = {
+                "connection_volume": RiskEngine.score_connection_volume(count),
+                "beacon_regularity": next(
+                    (b["beacon_score"] / 100 for b in beacon_results if b["ip"] == ip), 0.0
+                ),
+                "dns_entropy": 0.0,
+                "rare_port": 0.0,
+                "http_anomaly": 0.0,
+            }
+            score, label = RiskEngine.composite(signals)
+            top_talkers.append({
+                "ip": ip,
+                "connections": count,
+                "risk_score": score,
+                "risk_label": label,
+            })
+
+        http_alerts = [e for e in self.http_events if e["anomaly_score"] >= 50]
+
+        duration = round(self.end_time - self.start_time, 1) if self.start_time else 0
+
+        return {
+            "meta": {
+                "file": self.pcap_file,
+                "analyzed_at": datetime.utcnow().isoformat() + "Z",
+                "packet_count": self.packet_count,
+                "duration_sec": duration,
+                "unique_ips": len(self.ip_counter),
+            },
+            "top_talkers": top_talkers,
+            "beaconing": beacon_results,
+            "dns": dns_results,
+            "ports": port_results,
+            "http_alerts": http_alerts,
+        }
+
+
+# ─────────────────────────────────────────────
+# Output: Console
+# ─────────────────────────────────────────────
+def print_report(results: dict):
+    meta = results["meta"]
+    sep = "─" * 60
+
+    print(f"\n{'═'*60}")
+    print(f"  SOC PCAP ANALYSIS REPORT")
+    print(f"  File     : {meta['file']}")
+    print(f"  Analyzed : {meta['analyzed_at']}")
+    print(f"  Packets  : {meta['packet_count']:,}  |  Duration: {meta['duration_sec']}s")
+    print(f"  Unique IPs: {meta['unique_ips']}")
+    print(f"{'═'*60}\n")
+
+    print(f"{Fore.CYAN}[TOP TALKERS]{Style.RESET_ALL}")
+    print(sep)
+    for t in results["top_talkers"][:8]:
+        color = (Fore.RED if t["risk_label"] in ("CRITICAL","HIGH")
+                 else Fore.YELLOW if t["risk_label"] == "MEDIUM"
+                 else Fore.GREEN)
+        print(f"  {t['ip']:<20} {t['connections']:>5} conns  "
+              f"Risk: {color}{t['risk_label']:8}{Style.RESET_ALL}  Score: {t['risk_score']}")
+
+    print(f"\n{Fore.RED}[BEACONING ALERTS — T1071]{Style.RESET_ALL}")
+    print(sep)
+    if results["beaconing"]:
+        for b in results["beaconing"]:
+            print(f"  {Fore.RED}[!]{Style.RESET_ALL} {b['ip']:<20}  "
+                  f"Pkts: {b['packet_count']:<6} "
+                  f"Interval CV: {b['interval_cv']:<8}  "
+                  f"Beacon Score: {b['beacon_score']}/100")
+    else:
+        print(f"  {Fore.GREEN}No beaconing detected.{Style.RESET_ALL}")
+
+    print(f"\n{Fore.YELLOW}[DNS ANALYSIS — T1048.003]{Style.RESET_ALL}")
+    print(sep)
+    dns = results["dns"]
+    print(f"  Total queries: {dns['total_queries']}  |  Unique domains: {dns['unique_domains']}")
+    if dns["suspicious"]:
+        print(f"\n  {Fore.RED}Suspicious (high entropy):{Style.RESET_ALL}")
+        for s in dns["suspicious"]:
+            print(f"    [!] {s['hostname'][:55]:<55}  Entropy: {s['entropy_score']}/100")
+
+    print(f"\n{Fore.YELLOW}[HTTP ANOMALIES — T1190]{Style.RESET_ALL}")
+    print(sep)
+    if results["http_alerts"]:
+        for h in results["http_alerts"]:
+            print(f"  {Fore.RED}[!]{Style.RESET_ALL} {h['src']} → {h['dst']}")
+            print(f"      {h['info'][:80]}")
+            print(f"      Anomaly Score: {h['anomaly_score']}/100")
+    else:
+        print(f"  {Fore.GREEN}No HTTP anomalies detected.{Style.RESET_ALL}")
+
+    print(f"\n{Fore.YELLOW}[RARE PORT ALERTS — T1571]{Style.RESET_ALL}")
+    print(sep)
+    if results["ports"]["rare_port_alerts"]:
+        seen = set()
+        for r in results["ports"]["rare_port_alerts"]:
+            key = (r["src"], r["port"])
+            if key not in seen:
+                seen.add(key)
+                print(f"  {Fore.RED}[!]{Style.RESET_ALL} {r['src']} → port {r['port']}  {r['mitre']['id']}")
+    else:
+        print(f"  {Fore.GREEN}No rare port usage detected.{Style.RESET_ALL}")
+
+    print(f"\n{'═'*60}\n")
+
+
+# ─────────────────────────────────────────────
+# Output: CSV
+# ─────────────────────────────────────────────
+def export_csv(results: dict, output_dir: str = "reports"):
+    Path(output_dir).mkdir(exist_ok=True)
+    ts = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+
+    rows = []
+    for t in results["top_talkers"]:
+        rows.append({
+            "type": "top_talker", "ip": t["ip"],
+            "connections": t["connections"],
+            "risk_score": t["risk_score"], "risk_label": t["risk_label"],
+        })
+    for b in results["beaconing"]:
+        rows.append({
+            "type": "beacon_alert", "ip": b["ip"],
+            "packet_count": b["packet_count"],
+            "beacon_score": b["beacon_score"],
+            "interval_cv": b["interval_cv"],
+            "mitre_id": b["mitre"]["id"],
+            "mitre_name": b["mitre"]["name"],
+        })
+    for s in results["dns"]["suspicious"]:
+        rows.append({
+            "type": "dns_suspicious", "hostname": s["hostname"],
+            "query_count": s["query_count"],
+            "entropy_score": s["entropy_score"],
+            "mitre_id": s["mitre"]["id"],
+        })
+
+    if HAS_DEPS:
+        path = f"{output_dir}/soc_report_{ts}.csv"
+        pd.DataFrame(rows).to_csv(path, index=False)
+        return path
+    return None
+
+
+# ─────────────────────────────────────────────
+# Output: JSON
+# ─────────────────────────────────────────────
+def export_json(results: dict, output_dir: str = "reports") -> str:
+    Path(output_dir).mkdir(exist_ok=True)
+    ts = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+    path = f"{output_dir}/soc_report_{ts}.json"
+    with open(path, "w") as f:
+        json.dump(results, f, indent=2)
+    return path
+
+
+# ─────────────────────────────────────────────
+# CLI Entry Point
+# ─────────────────────────────────────────────
+def main():
+    parser = argparse.ArgumentParser(
+        description="SOC-Style PCAP Analyzer — Tony Lee",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  python analyzer.py --pcap capture.pcap
+  python analyzer.py --pcap capture.pcap --output json
+  python analyzer.py --pcap capture.pcap --threshold 15 --output csv
+  python analyzer.py --demo
+        """
+    )
+    parser.add_argument("--pcap",      type=str, default="sample.pcap", help="Path to .pcap file")
+    parser.add_argument("--threshold", type=int, default=20, help="Min connections for beacon check (default: 20)")
+    parser.add_argument("--output",    type=str, choices=["console", "csv", "json", "all"],
+                        default="all", help="Output format")
+    parser.add_argument("--demo",      action="store_true", help="Run with synthetic demo data")
+    args = parser.parse_args()
+
+    pcap_file = "demo_synthetic" if args.demo else args.pcap
+
+    analyzer = PCAPAnalyzer(pcap_file=pcap_file, beacon_threshold=args.threshold)
+    analyzer.load()
+    results = analyzer.run()
+
+    if args.output in ("console", "all"):
+        print_report(results)
+
+    if args.output in ("csv", "all"):
+        path = export_csv(results)
+        if path:
+            print(f"[+] CSV exported → {path}")
+
+    if args.output in ("json", "all"):
+        path = export_json(results)
+        print(f"[+] JSON exported → {path}")
+
+
+if __name__ == "__main__":
+    main()
