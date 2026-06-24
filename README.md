@@ -2,8 +2,7 @@
 
 A Python-based PCAP analysis tool simulating real SOC analyst workflows. Performs **beaconing detection via interval variance analysis**, DNS exfiltration scoring, HTTP anomaly detection, and rare-port alerting — all mapped to MITRE ATT&CK TTPs. Outputs structured console, CSV, and JSON reports.
 
-> Built as a portfolio project by Michael "Tony" Lee — SOC Analyst | MSSP | DFIR  
-> 🔗 [Live Dashboard Demo](https://your-github-username.github.io/pcap-analyzer/)
+> Built as a portfolio project by Michael "Tony" Lee — SOC Analyst | MSSP | DFIR 
 
 ---
 
