@@ -107,15 +107,6 @@ analyzer.py
 ├── DNSAnalyzer         # Query entropy scoring + known-benign filtering
 ├── PortAnalyzer        # Rare port detection → T1571
 └── PCAPAnalyzer        # Orchestrator: load → analyze → report
-```
-
----
-
-## Dashboard
-
-A standalone `dashboard.html` is included for visual reporting. Open locally or deploy via GitHub Pages.
-
-![Dashboard Screenshot](https://via.placeholder.com/900x500/0d1117/58a6ff?text=SOC+Dashboard)
 
 ---
 
